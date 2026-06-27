@@ -21,11 +21,11 @@ SENDER_DEVICE = os.getenv("sender_device", "cpu")
 RECEIVER_DEVICE = os.getenv("receiver_device", "cpu")
 SCENARIO = os.getenv("memory_pool_scenario", "throughput")
 
-NO_POOL_REUSE = os.environ.get("HETEROPOOL_NO_POOL_REUSE") == "1"
-# Ablation: when HETEROPOOL_IF_PINNED=0, write_memory_pool skips
+NO_REUSE = os.environ.get("HETEROPOOL_NO_REUSE") == "1"
+# Ablation: when HETEROPOOL_NO_PIN=1, write_memory_pool skips
 # cudaHostRegister/Unregister on the source tensor, so cudaMemcpy
-# uses pageable memory.  Default True (pinned DMA = Full mode).
-IF_PINNED = os.environ.get("HETEROPOOL_IF_PINNED", "1") == "1"
+# uses pageable memory (Pageable mode).
+NO_PIN = os.environ.get("HETEROPOOL_NO_PIN", "0") == "1"
 
 node = Node("sender_node")
 data_generation = np.random.default_rng()
@@ -40,7 +40,7 @@ for i in range(MESSAGE_COUNT):
 
     tensor_info = get_tensor_info(torch_tensor)
 
-    if NO_POOL_REUSE:
+    if NO_REUSE:
         # Ablation: register a fresh pool every frame, write once.
         # The receiver reads the pool, validates, and sends next_require.
         # After the receiver is done (node.next() returns below), we
@@ -51,7 +51,7 @@ for i in range(MESSAGE_COUNT):
         memory_pool_id = node.register_memory_pool(tensor_info, RECEIVER_DEVICE)
         if i == 0:
             print(f"Sender preview: {torch_tensor[:5]}")
-        node.write_memory_pool(memory_pool_id, tensor_info, if_pinned=IF_PINNED)
+        node.write_memory_pool(memory_pool_id, tensor_info, if_pinned=not NO_PIN)
         node.send_output("data", memory_pool_id, metadata)
     elif i == 0:
         print(f"Sender preview: {torch_tensor[:5]}")
@@ -60,11 +60,11 @@ for i in range(MESSAGE_COUNT):
     else:
         if SCENARIO == "write_after_free" and i == 1:
             node.free_memory_pool(memory_pool_id)
-        node.write_memory_pool(memory_pool_id, tensor_info, if_pinned=IF_PINNED)
+        node.write_memory_pool(memory_pool_id, tensor_info, if_pinned=not NO_PIN)
         node.send_output("data", pa.array([]), metadata)
 
     node.next()
-    if NO_POOL_REUSE:
+    if NO_REUSE:
         # Receiver has read the pool and sent next_require.  Now clean up
         # the sender-side resources (GPU buffer via cudaMalloc, pinned
         # host memory via cudaHostRegister) — these live in the sender

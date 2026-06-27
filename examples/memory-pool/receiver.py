@@ -10,11 +10,11 @@ from dora import Node
 from dora.cuda import tensor_from_info
 from tqdm import tqdm
 
-NO_POOL_REUSE = os.environ.get("HETEROPOOL_NO_POOL_REUSE") == "1"
-# Ablation: when HETEROPOOL_IF_FAST=0, read_memory_pool forces the daemon
+NO_REUSE = os.environ.get("HETEROPOOL_NO_REUSE") == "1"
+# Ablation: when HETEROPOOL_NO_FASTPATH=1, read_memory_pool forces the daemon
 # slow path every frame (no DORADMA fast path, no view binding).
 # Default True (fast path enabled = Full/-Pinned mode).
-IF_FAST = os.environ.get("HETEROPOOL_IF_FAST", "1") == "1"
+NO_FASTPATH = os.environ.get("HETEROPOOL_NO_FASTPATH", "0") == "1"
 
 node = Node("receiver_node")
 MESSAGE_COUNT = int(os.getenv("message_num", "100"))
@@ -33,23 +33,23 @@ for i in range(MESSAGE_COUNT):
     event = node.next()
     t_send = event["metadata"]["t_send"]
 
-    if NO_POOL_REUSE:
+    if NO_REUSE:
         # Ablation: sender creates a fresh pool each frame; read the new
         # pool_id from the event value every frame.
         memory_pool_id = event["value"]
-        tensor_info = node.read_memory_pool(memory_pool_id, if_fast=IF_FAST)
+        tensor_info = node.read_memory_pool(memory_pool_id, if_fast=not NO_FASTPATH)
         torch_tensor = tensor_from_info(tensor_info)
     elif i == 0:
         memory_pool_id = event["value"]
-        tensor_info = node.read_memory_pool(memory_pool_id, if_fast=IF_FAST)
+        tensor_info = node.read_memory_pool(memory_pool_id, if_fast=not NO_FASTPATH)
         torch_tensor = tensor_from_info(tensor_info)
         print(f"Receiver preview: {torch_tensor[:5]}")
-    elif not IF_FAST:
+    elif NO_FASTPATH:
         # Ablation: pool is reused, but every frame we go through the
         # daemon slow path and rebuild the tensor from metadata —
         # no fast path, no view binding.  memory_pool_id was captured
         # from frame 0 (sender sends empty payload for frames > 0).
-        tensor_info = node.read_memory_pool(memory_pool_id, if_fast=IF_FAST)
+        tensor_info = node.read_memory_pool(memory_pool_id, if_fast=not NO_FASTPATH)
         torch_tensor = tensor_from_info(tensor_info)
 
     # The tensor is zero-copy — write_memory_pool on the sender overwrites
@@ -71,7 +71,7 @@ for i in range(MESSAGE_COUNT):
     velocity = data_bytes / (delta_t * 1e-9 * 1024 * 1024)
     velocities.append(velocity)
 
-    if NO_POOL_REUSE:
+    if NO_REUSE:
         # Ablation: sender creates a fresh pool each frame; we free
         # it after reading so the lifecycle is register→write→read→free
         # every single iteration.
