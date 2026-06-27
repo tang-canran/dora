@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use arrow::array::{Array, BinaryArray, StringArray};
@@ -356,13 +356,17 @@ def _ipc_close(d_ptr):
     if err != 0:
         raise RuntimeError(f'cudaIpcCloseMemHandle(0x{d_ptr:x}) failed: {err}')
 
-def dma_copy(ptr, size, slot):
+def dma_copy(ptr, size, slot, no_dma):
     """DMA transfer from host to pre-allocated GPU buffer.
 
     Pins source memory, copies via cudaMemcpyHtoD (DMA engine),
     then unpins. Returns the device pointer of the pooled GPU buffer.
+
+    When no_dma=True the pin/unpin calls are skipped so the
+    copy goes through the kernel bounce-buffer path (pageable memory).
     """
-    _register_host(ptr, size)
+    if not no_dma:
+        _register_host(ptr, size)
     try:
         d_ptr = _get_gpu_buf(slot, size)
         err = _lib.cudaMemcpy(
@@ -375,7 +379,8 @@ def dma_copy(ptr, size, slot):
             raise RuntimeError(f'cudaMemcpy failed: {err}')
         _lib.cudaDeviceSynchronize()
     finally:
-        _unregister_host(ptr)
+        if not no_dma:
+            _unregister_host(ptr)
     return d_ptr
 
 "#;
@@ -1155,6 +1160,7 @@ impl Node {
         let is_cuda = tensor_device.starts_with("cuda");
         let receiver_is_cuda = device.starts_with("cuda");
         let cpu_mode = !receiver_is_cuda;
+        let no_dma = false;  // register is one-time; always pin
 
         if ptr_val == 0 {
             eyre::bail!("Invalid source pointer (NULL)");
@@ -1214,9 +1220,11 @@ impl Node {
             })?;
         let shmem_ptr = unsafe { shmem.as_slice_mut().as_mut_ptr() };
 
-        if let Ok(helpers) = get_cuda_helpers(py) {
-            let bound = helpers.bind(py);
-            let _ = bound.call_method1("_register_host", (shmem_ptr as u64, total_size));
+        if !no_dma {
+            if let Ok(helpers) = get_cuda_helpers(py) {
+                let bound = helpers.bind(py);
+                let _ = bound.call_method1("_register_host", (shmem_ptr as u64, total_size));
+            }
         }
 
         shmem.set_owner(false);
@@ -1270,11 +1278,11 @@ impl Node {
         // GPU pool: DMA data into pooled GPU buffer + IPC export.
         // Receiver imports the handle once (cudaIpcOpenMemHandle) and
         // reads from GPU DRAM with zero copy thereafter.
-        if receiver_is_cuda {
+        if receiver_is_cuda && !no_dma {
             if let Ok(helpers) = get_cuda_helpers(py) {
                 let bound = helpers.bind(py);
                 if let Ok(gpu_ptr) = bound
-                    .call_method1("dma_copy", (ptr_val, size, pool_counter))
+                    .call_method1("dma_copy", (ptr_val, size, pool_counter, no_dma))
                     .and_then(|r| r.extract::<u64>())
                 {
                     if let Ok(handle) = bound
@@ -1408,12 +1416,13 @@ impl Node {
     /// The bundled `examples/memory-pool/` dataflows demonstrate correct
     /// turn-based usage: the sender writes, outputs the pool ID, and waits
     /// for the next input event before writing again.
-    #[pyo3(signature = (memory_pool_id, tensor_info))]
+    #[pyo3(signature = (memory_pool_id, tensor_info, *, if_pinned=true))]
     pub fn write_memory_pool(
         &self,
         memory_pool_id: Py<PyAny>,
         tensor_info: &Bound<'_, PyDict>,
         py: Python,
+        if_pinned: bool,
     ) -> eyre::Result<()> {
         let buffer_id = parse_memory_pool_id(memory_pool_id, py)?;
 
@@ -1430,6 +1439,9 @@ impl Node {
             .ok_or_else(|| eyre::eyre!("missing device"))?
             .extract()?;
         let is_cuda = tensor_device.starts_with("cuda");
+        // Ablation: when if_pinned=false, skip cudaHostRegister/Unregister
+        // in dma_copy so cudaMemcpy uses a pageable source.
+        let no_dma = !if_pinned;
 
         {
             let freed = FREED_POOL_IDS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1533,11 +1545,13 @@ impl Node {
                                     std::ptr::write_volatile(gen_ptr, old_gen + 1);
                                     std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
                                 }
-                                // DMA: source CPU data -> GPU pool buffer via DMA engine
+                                // DMA: source CPU data -> GPU pool buffer via DMA engine.
+                                // When no_dma=true, dma_copy skips cudaHostRegister/Unregister
+                                // but still does cudaMemcpyHtoD — pageable source, same GPU dest.
                                 if let Ok(helpers) = get_cuda_helpers(py) {
                                     let bound = helpers.bind(py);
                                     let _ =
-                                        bound.call_method1("dma_copy", (ptr_val, size, counter));
+                                        bound.call_method1("dma_copy", (ptr_val, size, counter, no_dma));
                                 }
                                 // Seqlock: end write
                                 unsafe {
@@ -1670,10 +1684,14 @@ impl Node {
                                     std::ptr::write_volatile(gen_ptr, old_gen + 1);
                                     std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
                                 }
-                                if let (Ok(helpers), Some(c)) = (get_cuda_helpers(py), slow_counter)
+                                // Slow path: always use dma_copy (GPU pool).  When
+                                // no_dma=true, dma_copy skips pin/unpin internally.
+                                if let (Ok(helpers), Some(c)) =
+                                    (get_cuda_helpers(py), slow_counter)
                                 {
                                     let bound = helpers.bind(py);
-                                    let _ = bound.call_method1("dma_copy", (ptr_val, size, c));
+                                    let _ =
+                                        bound.call_method1("dma_copy", (ptr_val, size, c, no_dma));
                                 }
                                 // Seqlock: end write
                                 unsafe {
@@ -1766,16 +1784,21 @@ impl Node {
     /// the dataflow graph's `next_require` round-trip) that it is safe to
     /// write the next frame. The bundled `examples/memory-pool/` dataflows
     /// demonstrate this pattern.
-    #[pyo3(signature = (memory_pool_id))]
+    #[pyo3(signature = (memory_pool_id, *, if_fast=true))]
     pub fn read_memory_pool(
         &self,
         memory_pool_id: Py<PyAny>,
         py: Python,
+        if_fast: bool,
     ) -> eyre::Result<Py<PyAny>> {
         let buffer_id = parse_memory_pool_id(memory_pool_id, py)?;
 
-        // Fast path: DORADMA header read
-        if buffer_id.starts_with("pool_") {
+        // Fast path: DORADMA header read.
+        // Ablation: when if_fast=false, skip the fast path entirely so
+        // every read_memory_pool call goes through the daemon slow path
+        // (query daemon + rebuild tensor from metadata).
+        if buffer_id.starts_with("pool_") && if_fast
+        {
             if let Some(result) = self.try_doradma_read(&buffer_id, py)? {
                 return Ok(result);
             }
@@ -1906,20 +1929,59 @@ impl Node {
                     eyre::bail!("memory pool {} not found or has invalid pointer", buffer_id);
                 }
 
-                // The daemon fallback always derives read_ptr from a host
-                // mmap address (shmem_ptr + data_offset).  For a CUDA pool
-                // this is not a valid device pointer — the fast path
-                // (try_doradma_read) must be used instead.  Reject to
-                // prevent tensor_from_info from receiving a host pointer
-                // labelled as device=cuda.
+                // For CUDA pools the host mmap address is not a valid device
+                // pointer.  Resolve the GPU VA from the IPC handle embedded
+                // in the shmem header (or via cudaHostRegister + getDevicePtr
+                // for host-registered pools).  This mirrors the fast-path
+                // logic in try_doradma_read — the daemon query above provides
+                // the "slow path" overhead we want to measure in the ablation.
                 let device = if pinned_type.starts_with("cuda") {
-                    warn_missing_memory_pool(&self.node_id, "read", &buffer_id);
-                    eyre::bail!(
-                        "memory pool {}: daemon fallback cannot provide a CUDA pointer \
-                         (fast path returned None); check that the pool was registered \
-                         with the correct receiver device",
-                        buffer_id,
-                    );
+                    if let Some(ref name) = shmem_name {
+                        if let Ok(shmem2) = ShmemConf::new().os_id(name).open() {
+                            if shmem2.len() >= DORADMA_HEADER_SIZE {
+                                let sp = shmem2.as_ptr();
+                                let ipc_present =
+                                    unsafe { std::ptr::read(sp.add(24) as *const u64) };
+                                if ipc_present == 1 {
+                                    let handle_bytes =
+                                        unsafe { std::slice::from_raw_parts(sp.add(32), 64) };
+                                    if let Ok(helpers) = get_cuda_helpers(py) {
+                                        let bound = helpers.bind(py);
+                                        let handle_py = PyBytes::new(py, handle_bytes);
+                                        if let Ok(gpu_ptr) = bound
+                                            .call_method1("_ipc_import", (handle_py,))
+                                            .and_then(|r| r.extract::<u64>())
+                                        {
+                                            read_ptr = gpu_ptr as i64;
+                                        }
+                                    }
+                                } else {
+                                    // Host-registered pool: pin + get device ptr
+                                    if let Ok(helpers) = get_cuda_helpers(py) {
+                                        let bound = helpers.bind(py);
+                                        let _ = bound.call_method1(
+                                            "_register_host",
+                                            (sp as u64, shmem2.len()),
+                                        );
+                                        if let Ok(va) = bound
+                                            .call_method1("_get_device_ptr", (sp as u64,))
+                                            .and_then(|r| r.extract::<u64>())
+                                        {
+                                            read_ptr = (va + DORADMA_HEADER_SIZE as u64) as i64;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if read_ptr == 0 {
+                        warn_missing_memory_pool(&self.node_id, "read", &buffer_id);
+                        eyre::bail!(
+                            "memory pool {}: slow-path GPU pointer resolution failed",
+                            buffer_id,
+                        );
+                    }
+                    "cuda"
                 } else {
                     "cpu"
                 };
@@ -2201,6 +2263,7 @@ impl Node {
             .strip_prefix("pool_")
             .and_then(|s| s.strip_suffix(&format!("_{counter}")))
             .unwrap_or("");
+        let no_dma = false;  // receiver-side read; pinning not gated here
 
         // Check freed tracking -> if this buffer was freed, fall back to daemon
         {
@@ -2382,9 +2445,11 @@ impl Node {
                         let helpers = get_cuda_helpers(py)
                             .map_err(|e| eyre::eyre!("get_cuda_helpers: {}", e))?;
                         let bound = helpers.bind(py);
-                        bound
-                            .call_method1("_register_host", (shmem_ptr as u64, shmem_size))
-                            .map_err(|e| eyre::eyre!("_register_host: {}", e))?;
+                        if !no_dma {
+                            bound
+                                .call_method1("_register_host", (shmem_ptr as u64, shmem_size))
+                                .map_err(|e| eyre::eyre!("_register_host: {}", e))?;
+                        }
                         let va: u64 = bound
                             .call_method1("_get_device_ptr", (shmem_ptr as u64,))
                             .map_err(|e| eyre::eyre!("_get_device_ptr: {}", e))?
