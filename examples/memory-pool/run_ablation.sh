@@ -7,15 +7,15 @@
 #       Delegates to run_ablation.py to run 4 modes × 3 scenarios × 10 reps.
 #
 #   (b) Single-run mode (mode + yaml args):
-#         ./run_ablation.sh <full|nodma|nofpview|alloff> <yaml>
+#         ./run_ablation.sh <full|pageable|nofastpath|noreuse> <yaml>
 #       Runs one dataflow with the given ablation settings.  Useful for
 #       ad-hoc testing during development.
 #
 # Examples:
-#   ./run_ablation.sh                          # full matrix
-#   ./run_ablation.sh -n 2                     # quick smoke test
-#   ./run_ablation.sh --dry-run                # preview plan
-#   ./run_ablation.sh nodma cpu2cuda.yml       # single ad-hoc run
+#   ./run_ablation.sh                            # full matrix
+#   ./run_ablation.sh -n 2                       # quick smoke test
+#   ./run_ablation.sh --dry-run                  # preview plan
+#   ./run_ablation.sh pageable cpu2cuda.yml      # single ad-hoc run
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -30,19 +30,16 @@ fi
 # ------------------------------------------------------------------
 # Single-run mode (mode + yaml)
 # ------------------------------------------------------------------
-MODE="${1:?Usage: $0 <full|nodma|nofpview|alloff> <yaml>}"
-YAML="${2:?Usage: $0 <full|nodma|nofpview|alloff> <yaml>}"
+MODE="${1:?Usage: $0 <full|pageable|nofastpath|noreuse> <yaml>}"
+YAML="${2:?Usage: $0 <full|pageable|nofastpath|noreuse> <yaml>}"
 
 case "$MODE" in
-  full)     ;;
-  nodma)    export HETEROPOOL_NO_DMA=1 ;;
-  nofpview) export HETEROPOOL_NO_DMA=1
-             export HETEROPOOL_NO_FASTPATH_VIEW=1 ;;
-  alloff)   export HETEROPOOL_NO_DMA=1
-             export HETEROPOOL_NO_FASTPATH_VIEW=1
-             export HETEROPOOL_NO_POOL_REUSE=1 ;;
+  full)       ;;
+  pageable)   export HETEROPOOL_NO_PIN=1 ;;
+  nofastpath) export HETEROPOOL_NO_FASTPATH=1 ;;
+  noreuse)    export HETEROPOOL_NO_REUSE=1 ;;
   *)
-    echo "Unknown mode '$MODE'. Valid: full, nodma, nofpview, alloff"
+    echo "Unknown mode '$MODE'. Valid: full, pageable, nofastpath, noreuse"
     exit 1 ;;
 esac
 

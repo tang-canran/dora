@@ -44,16 +44,18 @@ THROUGHPUT_RE = re.compile(
     r"Average transfer throughput:\s+([0-9]+(?:\.[0-9]+)?)\s*MB/s"
 )
 
-# Experiment modes: label → env vars dict
+# Experiment modes: label → env vars dict.
+# Per-dimension independent baselines: each mode disables ONE optimization while
+# the other two remain at their optimal configuration for the data size.
+#   Full:      pinned DMA + fast-path view + pool reuse   (optimal baseline)
+#   Pageable:  pageable DMA (no cudaHostRegister)         (DMA path ablation)
+#   NoFastPath: daemon slow-path every frame               (fast-path ablation)
+#   NoReuse:   fresh pool per frame (no pool reuse)        (pool-reuse ablation)
 MODES: dict[str, dict[str, str]] = {
-    "full": {},
-    "nodma": {"HETEROPOOL_NO_DMA": "1"},
-    "nofpview": {"HETEROPOOL_NO_DMA": "1", "HETEROPOOL_NO_FASTPATH_VIEW": "1"},
-    "alloff": {
-        "HETEROPOOL_NO_DMA": "1",
-        "HETEROPOOL_NO_FASTPATH_VIEW": "1",
-        "HETEROPOOL_NO_POOL_REUSE": "1",
-    },
+    "full":       {},
+    "pageable":   {"HETEROPOOL_NO_PIN": "1"},
+    "nofastpath": {"HETEROPOOL_NO_FASTPATH": "1"},
+    "noreuse":    {"HETEROPOOL_NO_REUSE": "1"},
 }
 
 # Scenarios: label → (yaml_filename, needs_gpu)
@@ -165,7 +167,13 @@ class AblationRunner:
         return True
 
     def cleanup_stale(self) -> None:
-        """Kill orphaned dora processes and clean /dev/shm."""
+        """Kill orphaned dora processes and clean stale state.
+
+        Stale lock files in out/ and .dora/python-envs/ survive crashes and
+        can cause the next ``dora run`` to block waiting for a lock held by a
+        process that no longer exists.  Removing them between runs prevents
+        the experiment from hanging.
+        """
         for name in ("dora-daemon", "dora-coordinator"):
             subprocess.run(
                 ["pkill", "-f", name],
@@ -179,6 +187,18 @@ class AblationRunner:
                     f.unlink()
                 except OSError:
                     pass
+        # Clean stale dora session lock files (survive crashes / SIGKILL)
+        for lock in MEMORY_POOL_DIR.glob("out/*.lock"):
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+        # Clean stale per-node Python-env locks
+        for lock in MEMORY_POOL_DIR.glob(".dora/python-envs/*/.lock"):
+            try:
+                lock.unlink()
+            except OSError:
+                pass
         time.sleep(0.5)
 
     def gpu_memory_used(self) -> Optional[int]:
@@ -218,7 +238,8 @@ class AblationRunner:
         if self.tensor_bytes:
             run_env["TENSOR_BYTES"] = str(self.tensor_bytes)
 
-        cmd = [DORA_BIN, "run", str(yaml_path), "--stop-after", "100s"]
+        stop_after_s = max(15, self.timeout - 10)
+        cmd = [DORA_BIN, "run", str(yaml_path), "--stop-after", f"{stop_after_s}s"]
 
         if self.dry_run:
             env_str = " ".join(f"{k}={v}" for k, v in env_vars.items()) if env_vars else "(none)"

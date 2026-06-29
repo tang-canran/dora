@@ -72,10 +72,12 @@ for i in range(MESSAGE_COUNT):
     velocities.append(velocity)
 
     if NO_REUSE:
-        # Ablation: sender creates a fresh pool each frame; we free
-        # it after reading so the lifecycle is register→write→read→free
-        # every single iteration.
-        node.free_memory_pool(memory_pool_id)
+        # Ablation: sender creates a fresh pool each frame.
+        # The sender frees the pool after node.next() returns below
+        # (GPU resources like cudaMalloc/cudaHostRegister are per-process
+        # and must be freed by the process that allocated them — the
+        # receiver cannot reach sender-side GPU allocations).
+        pass
     elif SCENARIO == "duplicate_free" and i == MESSAGE_COUNT - 1:
         node.free_memory_pool(memory_pool_id)
         node.free_memory_pool(memory_pool_id)

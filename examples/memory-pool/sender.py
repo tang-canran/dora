@@ -42,12 +42,11 @@ for i in range(MESSAGE_COUNT):
 
     if NO_REUSE:
         # Ablation: register a fresh pool every frame, write once.
-        # The receiver reads the pool, validates, and sends next_require.
-        # After the receiver is done (node.next() returns below), we
-        # free the pool from the sender side to clean up GPU buffers
-        # and pinned host memory that were allocated in this process
-        # (cudaMalloc / cudaHostRegister — per-process resources that
-        # the receiver's free_memory_pool cannot reach).
+        # Lifecycle: register → write → send → (receiver reads) → free.
+        # The sender frees after node.next() below — GPU resources like
+        # cudaMalloc / cudaHostRegister are per-process and must be freed
+        # by the process that allocated them.  The receiver does NOT free
+        # in the NO_REUSE path; only the sender does.
         memory_pool_id = node.register_memory_pool(tensor_info, RECEIVER_DEVICE)
         if i == 0:
             print(f"Sender preview: {torch_tensor[:5]}")
@@ -65,10 +64,8 @@ for i in range(MESSAGE_COUNT):
 
     node.next()
     if NO_REUSE:
-        # Receiver has read the pool and sent next_require.  Now clean up
-        # the sender-side resources (GPU buffer via cudaMalloc, pinned
-        # host memory via cudaHostRegister) — these live in the sender
-        # process and the receiver's free_memory_pool cannot reach them.
-        # The daemon-side deregistration is a no-op if the receiver already
-        # freed it (warn_missing_memory_pool is graceful).
+        # Free the pool from the sender side.  GPU resources (cudaMalloc,
+        # cudaHostRegister) are per-process — only the sender can free them.
+        # The receiver does not free in the NO_REUSE path, so this is the
+        # single deallocation point for the register→write→read→free cycle.
         node.free_memory_pool(memory_pool_id)
