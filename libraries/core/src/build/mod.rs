@@ -337,10 +337,20 @@ fn confine_subdir(clone_dir: &Path, subdir: &str) -> eyre::Result<PathBuf> {
 /// directory and silently clobber each other's envs.
 pub fn managed_python_env_dir(node: &ResolvedNode, node_working_dir: &Path) -> Option<PathBuf> {
     node_requires_managed_python_env(node).then(|| {
-        node_working_dir
-            .join(".dora")
-            .join("python-envs")
-            .join(node.id.as_ref())
+        let envs_base = node_working_dir.join(".dora").join("python-envs");
+        let env_dir = envs_base.join(node.id.as_ref());
+        // Defense-in-depth: the node id must not escape the python-envs/ directory.
+        // validate_node_id already rejects leading-dot ids (`.`, `..`, `.hidden`),
+        // so this assertion should never fire in practice — it guards against future
+        // callers that bypass validation.
+        debug_assert!(
+            !Path::new(node.id.as_ref())
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)),
+            "node id '{id}' contains a parent-dir segment",
+            id = node.id,
+        );
+        env_dir
     })
 }
 
