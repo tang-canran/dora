@@ -384,8 +384,13 @@ class AblationRunner:
         completed = 0
         run_index = 0
 
+        # Keep a stable reference to the top-level output directory so each
+        # size's subdirectory is created directly under it (not nested inside
+        # the previous size).
+        top_output_dir = self.output_dir
+
         for size_label, size_bytes in byte_sizes:
-            size_dir = self.output_dir / size_label
+            size_dir = top_output_dir / size_label
             logs_dir = size_dir / "logs"
             logs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -462,14 +467,16 @@ class AblationRunner:
 
             all_results[size_label] = size_results
             # Save per-size results after each size completes
-            self.output_dir = size_dir  # temporarily point to size_dir for _save_results
+            self.output_dir = size_dir
             self.results = size_results
             self._save_results()
             self._print_summary_table(size_results, f"  [{size_label}]", plan)
+            # Restore top-level output dir for next size (or final save)
+            self.output_dir = top_output_dir
 
-        # Restore
-        self.output_dir = self.output_dir.parent  # back to top-level dir
+        # Save aggregate across all sizes
         self.results = [r for lst in all_results.values() for r in lst]
+        self._save_multi_results(all_results, plan)
 
         # Final cleanup
         self.cleanup_stale()
@@ -477,7 +484,6 @@ class AblationRunner:
         elapsed_total = time.perf_counter() - self.start_time
         print(f"\n{'='*60}")
         print(f"All {total_runs} runs completed in {elapsed_total:.0f}s ({elapsed_total/3600:.1f}h)")
-        self._save_multi_results(all_results, plan)
         return True
 
     # ------------------------------------------------------------------
