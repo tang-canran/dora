@@ -177,13 +177,18 @@ class AblationRunner:
         can cause the next ``dora run`` to block waiting for a lock held by a
         process that no longer exists.  Removing them between runs prevents
         the experiment from hanging.
+
+        Uses SIGKILL (-9) so processes die immediately; the following
+        2 s sleep gives the kernel time to release ports and file locks
+        before the next ``dora run`` starts.
         """
         for name in ("dora-daemon", "dora-coordinator"):
             subprocess.run(
-                ["pkill", "-f", name],
+                ["pkill", "-9", "-f", name],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+        time.sleep(2)  # let OS release ports and file locks
         # Clean leftover shared-memory files
         for pattern in ("dora_pool_*", "dora_shm_*"):
             for f in Path("/dev/shm").glob(pattern):
@@ -306,6 +311,14 @@ class AblationRunner:
             result.duration_s = time.perf_counter() - t0
             result.status = "TIMEOUT"
             result.notes = f"timed out after {self.timeout}s"
+            # Kill orphaned daemon/coordinator processes so they don't
+            # block the next run (subprocess.run only kills the parent).
+            for name in ("dora-daemon", "dora-coordinator"):
+                subprocess.run(
+                    ["pkill", "-9", "-f", name],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
             # Write whatever we captured
             log_file.parent.mkdir(parents=True, exist_ok=True)
             with open(log_file, "w") as f:
