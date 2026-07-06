@@ -22,10 +22,11 @@ RECEIVER_DEVICE = os.getenv("receiver_device", "cpu")
 SCENARIO = os.getenv("memory_pool_scenario", "throughput")
 
 NO_REUSE = os.environ.get("HETEROPOOL_NO_REUSE") == "1"
-# Ablation: when HETEROPOOL_NO_PIN=1, write_memory_pool skips
-# cudaHostRegister/Unregister on the source tensor, so cudaMemcpy
-# uses pageable memory (Pageable mode).
-NO_PIN = os.environ.get("HETEROPOOL_NO_PIN", "0") == "1"
+# Ablation: HETEROPOOL_MODE controls write_memory_pool DMA strategy.
+#   "auto"     → auto-select pinned/pageable based on 25 MiB threshold (default)
+#   "pinned"   → always use cudaHostRegister + pinned DMA
+#   "pageable" → skip cudaHostRegister, use pageable cudaMemcpy
+WRITE_MODE = os.environ.get("HETEROPOOL_MODE", "auto")
 
 node = Node("sender_node")
 data_generation = np.random.default_rng()
@@ -50,7 +51,7 @@ for i in range(MESSAGE_COUNT):
         memory_pool_id = node.register_memory_pool(tensor_info, RECEIVER_DEVICE)
         if i == 0:
             print(f"Sender preview: {torch_tensor[:5]}")
-        node.write_memory_pool(memory_pool_id, tensor_info, if_pinned=not NO_PIN)
+        node.write_memory_pool(memory_pool_id, tensor_info, mode=WRITE_MODE)
         node.send_output("data", memory_pool_id, metadata)
     elif i == 0:
         print(f"Sender preview: {torch_tensor[:5]}")
@@ -59,10 +60,19 @@ for i in range(MESSAGE_COUNT):
     else:
         if SCENARIO == "write_after_free" and i == 1:
             node.free_memory_pool(memory_pool_id)
-        node.write_memory_pool(memory_pool_id, tensor_info, if_pinned=not NO_PIN)
+        node.write_memory_pool(memory_pool_id, tensor_info, mode=WRITE_MODE)
         node.send_output("data", pa.array([]), metadata)
 
-    node.next()
+    event = node.next()
+    # If the receiver crashed or the dataflow was stopped, node.next()
+    # returns an input-closed control event without 'metadata'.  Break
+    # instead of spinning on register_memory_pool calls that will fail.
+    if "metadata" not in event:
+        print(
+            f"Sender: input closed at iteration {i}/{MESSAGE_COUNT} "
+            f"(receiver may have crashed)"
+        )
+        break
     if NO_REUSE:
         # Free the pool from the sender side.  GPU resources (cudaMalloc,
         # cudaHostRegister) are per-process — only the sender can free them.

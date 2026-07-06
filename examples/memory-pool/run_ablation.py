@@ -45,17 +45,28 @@ THROUGHPUT_RE = re.compile(
 )
 
 # Experiment modes: label → env vars dict.
-# Per-dimension independent baselines: each mode disables ONE optimization while
-# the other two remain at their optimal configuration for the data size.
-#   Full:      pinned DMA + fast-path view + pool reuse   (optimal baseline)
-#   Pageable:  pageable DMA (no cudaHostRegister)         (DMA path ablation)
-#   NoFastPath: daemon slow-path every frame               (fast-path ablation)
-#   NoReuse:   fresh pool per frame (no pool reuse)        (pool-reuse ablation)
+# Three independent ablation dimensions, each with its own baseline:
+#   实验一 页锁内存 (only cpu2cuda):
+#     auto     — mode="auto"  auto-select pinned/pageable (production baseline)
+#     pinned   — mode="pinned"  always cudaHostRegister + DMA
+#     pageable — mode="pageable"  skip cudaHostRegister, pageable cudaMemcpy
+#   实验二 快速读取 (all scenarios):
+#     auto / nofastpath — if_fast=true vs if_fast=false on read_memory_pool
+#   实验三 池化复用 (all scenarios):
+#     auto / noreuse — pool reuse vs fresh pool per frame
 MODES: dict[str, dict[str, str]] = {
-    "full":       {},
-    "pageable":   {"HETEROPOOL_NO_PIN": "1"},
-    "nofastpath": {"HETEROPOOL_NO_FASTPATH": "1"},
-    "noreuse":    {"HETEROPOOL_NO_REUSE": "1"},
+    "auto":       {},                                   # production default
+    "pinned":     {"HETEROPOOL_MODE": "pinned"},         # 实验一
+    "pageable":   {"HETEROPOOL_MODE": "pageable"},       # 实验一
+    "nofastpath": {"HETEROPOOL_NO_FASTPATH": "1"},       # 实验二
+    "noreuse":    {"HETEROPOOL_NO_REUSE": "1"},          # 实验三
+}
+
+# Per-mode scenario filter: None = all scenarios, list = only those scenarios.
+# 实验一 (页锁内存) 仅在 cpu2cuda 上有差异, cpu2cpu/cuda2cpu 无 DMA 路径.
+MODE_SCENARIOS: dict[str, list[str] | None] = {
+    "pinned":   ["cpu2cuda"],
+    "pageable": ["cpu2cuda"],
 }
 
 # Scenarios: label → (yaml_filename, needs_gpu)
@@ -182,13 +193,26 @@ class AblationRunner:
         2 s sleep gives the kernel time to release ports and file locks
         before the next ``dora run`` starts.
         """
+        # Kill the full process tree: daemon, coordinator, and Python node
+        # processes that the daemon spawned (sender.py, receiver.py).
+        # When the daemon is killed with SIGKILL its children become orphans
+        # adopted by init — they keep running and hold mmap refs to /dev/shm
+        # pools, so the kernel won't free the space until they exit.  Kill
+        # the nodes first so their shmem mappings are released before we
+        # unlink the files.
+        for pattern in ("sender.py", "receiver.py"):
+            subprocess.run(
+                ["pkill", "-9", "-f", f"memory-pool/{pattern}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         for name in ("dora-daemon", "dora-coordinator"):
             subprocess.run(
                 ["pkill", "-9", "-f", name],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        time.sleep(2)  # let OS release ports and file locks
+        time.sleep(2)  # let OS release ports, shmem mappings, and file locks
         # Clean leftover shared-memory files
         for pattern in ("dora_pool_*", "dora_shm_*"):
             for f in Path("/dev/shm").glob(pattern):
@@ -311,14 +335,12 @@ class AblationRunner:
             result.duration_s = time.perf_counter() - t0
             result.status = "TIMEOUT"
             result.notes = f"timed out after {self.timeout}s"
-            # Kill orphaned daemon/coordinator processes so they don't
-            # block the next run (subprocess.run only kills the parent).
-            for name in ("dora-daemon", "dora-coordinator"):
-                subprocess.run(
-                    ["pkill", "-9", "-f", name],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+            # Clean up fully before returning — the subprocess timeout only
+            # kills the dora CLI parent; daemon, coordinator, and Python
+            # node children become orphans and leak /dev/shm space.
+            # cleanup_stale kills the full process tree and removes stale
+            # shmem and lock files so the next run starts from a clean state.
+            self.cleanup_stale()
             # Write whatever we captured
             log_file.parent.mkdir(parents=True, exist_ok=True)
             with open(log_file, "w") as f:
@@ -374,7 +396,13 @@ class AblationRunner:
                 if n_sizes > 1:
                     print(f"--- Size: {size_label} ---")
                 for mode in plan.modes:
-                    for scenario in plan.scenarios:
+                    allowed = MODE_SCENARIOS.get(mode, None)
+                    mode_scenarios = (
+                        [s for s in plan.scenarios if s in allowed]
+                        if allowed is not None
+                        else plan.scenarios
+                    )
+                    for scenario in mode_scenarios:
                         for r in range(1, self.repetitions + 1):
                             log_name = f"{mode}__{scenario}__run{r:02d}.log"
                             log_path = self.output_dir / "logs" / log_name
@@ -415,7 +443,14 @@ class AblationRunner:
             size_results: list[RunResult] = []
 
             for mode in plan.modes:
-                for scenario in plan.scenarios:
+                # Filter scenarios per mode (e.g. pinned/pageable only cpu2cuda)
+                allowed = MODE_SCENARIOS.get(mode, None)
+                mode_scenarios = (
+                    [s for s in plan.scenarios if s in allowed]
+                    if allowed is not None
+                    else plan.scenarios
+                )
+                for scenario in mode_scenarios:
                     _, needs_gpu = SCENARIOS[scenario]
                     for r in range(1, self.repetitions + 1):
                         run_index += 1
@@ -909,11 +944,22 @@ Examples:
         if not needs_gpu or (gpu_available and not args.skip_gpu)
     ]
 
+    # Calculate total runs accounting for per-mode scenario filters
+    total_runs = 0
+    for mode in active_modes:
+        allowed = MODE_SCENARIOS.get(mode, None)
+        n_scenarios = (
+            len([s for s in active_scenarios if s in allowed])
+            if allowed is not None
+            else len(active_scenarios)
+        )
+        total_runs += n_scenarios * args.repetitions
+
     plan = ExperimentPlan(
         modes=active_modes,
         scenarios=active_scenarios,
         repetitions=args.repetitions,
-        total_runs=len(active_modes) * len(active_scenarios) * args.repetitions,
+        total_runs=total_runs,
         gpu_available=gpu_available,
         build_fresh=build_fresh,
     )

@@ -30,16 +30,17 @@ fi
 # ------------------------------------------------------------------
 # Single-run mode (mode + yaml)
 # ------------------------------------------------------------------
-MODE="${1:?Usage: $0 <full|pageable|nofastpath|noreuse> <yaml>}"
-YAML="${2:?Usage: $0 <full|pageable|nofastpath|noreuse> <yaml>}"
+MODE="${1:?Usage: $0 <auto|pinned|pageable|nofastpath|noreuse> <yaml>}"
+YAML="${2:?Usage: $0 <auto|pinned|pageable|nofastpath|noreuse> <yaml>}"
 
 case "$MODE" in
-  full)       ;;
-  pageable)   export HETEROPOOL_NO_PIN=1 ;;
+  auto)       ;;
+  pinned)     export HETEROPOOL_MODE=pinned ;;
+  pageable)   export HETEROPOOL_MODE=pageable ;;
   nofastpath) export HETEROPOOL_NO_FASTPATH=1 ;;
   noreuse)    export HETEROPOOL_NO_REUSE=1 ;;
   *)
-    echo "Unknown mode '$MODE'. Valid: full, pageable, nofastpath, noreuse"
+    echo "Unknown mode '$MODE'. Valid: auto, pinned, pageable, nofastpath, noreuse"
     exit 1 ;;
 esac
 

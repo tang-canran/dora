@@ -1465,13 +1465,13 @@ impl Node {
     /// The bundled `examples/memory-pool/` dataflows demonstrate correct
     /// turn-based usage: the sender writes, outputs the pool ID, and waits
     /// for the next input event before writing again.
-    #[pyo3(signature = (memory_pool_id, tensor_info, *, if_pinned=true))]
+    #[pyo3(signature = (memory_pool_id, tensor_info, *, mode="auto"))]
     pub fn write_memory_pool(
         &self,
         memory_pool_id: Py<PyAny>,
         tensor_info: &Bound<'_, PyDict>,
         py: Python,
-        if_pinned: bool,
+        mode: &str,
     ) -> eyre::Result<()> {
         let buffer_id = parse_memory_pool_id(memory_pool_id, py)?;
 
@@ -1499,9 +1499,14 @@ impl Node {
 
         // Pin-decision guard shared by cache-miss PoolSlot construction and
         // slow-path dma_copy (cache-hit reuses the slot's stored is_pinned).
-        // When if_pinned=false (ablation: HETEROPOOL_NO_PIN=1), force pageable
-        // DMA regardless of tensor size.
-        let auto_pin = if_pinned && should_pin(is_cuda, size);
+        // mode="pinned"  → always use cudaHostRegister + DMA (ablation baseline)
+        // mode="pageable"→ skip cudaHostRegister, use pageable cudaMemcpy
+        // mode="auto"    → auto-select based on 25 MiB threshold (production default)
+        let auto_pin = match mode {
+            "pinned" => true,
+            "pageable" => false,
+            _ => should_pin(is_cuda, size), // "auto" or unrecognised → auto-select
+        };
 
         // Fast path: pool_ format -> DORADMA
         if buffer_id.starts_with("pool_") {
@@ -1524,10 +1529,16 @@ impl Node {
                 // stored back into PINNED_POOL after the write — this keeps
                 // the shmem mapping alive for the duration of the data copy.
                 let (shmem_ptr, shmem_capacity, store_back, is_pinned) =
-                    if let Some(slot_data) = pool_slot {
-                        // Cache hit: reuse the persistent mapping (no mmap)
+                    if let Some(mut slot_data) = pool_slot {
+                        // Cache hit: reuse the persistent mapping (no mmap).
+                        // Override is_pinned with the caller's mode choice so
+                        // ablation experiments (pinned/pageable/auto) actually
+                        // take effect — register_memory_pool always sets the
+                        // slot to auto-select, which would silently mask the
+                        // mode on every subsequent cache hit.
                         let cap = slot_data.size;
-                        let pinned = slot_data.is_pinned;
+                        slot_data.is_pinned = auto_pin;
+                        let pinned = auto_pin;
                         (slot_data.base as *mut u8, cap, Some(slot_data), pinned)
                     } else {
                         // Cache miss: open via ShmemConf, wrap immediately
