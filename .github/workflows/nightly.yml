@@ -25,24 +25,12 @@ name: Nightly Regression
 # pip-release.yml does) rather than saving into the GitHub budget.
 #
 # Triggers:
-#   - schedule: daily at 06:00 UTC
-#   - workflow_dispatch: manual run from Actions UI
-#   - push to main under `paths:` — ONLY re-runs when this workflow
-#     file itself changes, so maintainers editing the nightly pipeline
-#     get an immediate validation run. Every-push triggering was
-#     considered and rejected: the suite is intentionally expensive
-#     (~11 min smoke + 11 fault-tolerance subjobs) and the Tier 1
-#     policy in docs/testing-matrix.md treats it as lower-frequency
-#     regression coverage, not a per-commit gate (#1656).
+#   - workflow_dispatch: manual run from Actions UI only
+#   - schedule/push triggers are intentionally disabled so this workflow
+#     no longer runs on a nightly or automatic basis.
 
 on:
-  schedule:
-    - cron: "0 6 * * *"
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/nightly.yml"
 
 permissions:
   contents: read
